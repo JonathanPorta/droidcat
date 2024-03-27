@@ -1,0 +1,160 @@
+#!/bin/bash
+
+# Function to display help text
+show_help() {
+    echo "Usage: droidcat COMMAND [OPTIONS]"
+    echo
+    echo "Commands:"
+    echo "  extract [ID]                          Extracts data from the connected Android device."
+    echo "  unpack /path/to/ab [password]         Unpacks a password-protected .ab backup file."
+    echo "  --help, -h                            Display this help message and exit."
+    echo
+    echo "Examples:"
+    echo "  droidcat extract myDeviceID           Extract data with an ID flag 'myDeviceID'."
+    echo "  droidcat unpack backup.ab password    Unpack 'backup.ab' using the provided password."
+    echo "  droidcat --help                       Display the help message."
+    echo
+}
+
+# Function for the extract command
+extract_data() {
+    ID_FLAG=$1
+    echo "Extract command executed with ID: $ID_FLAG"
+
+    # Generate a timestamp
+    TIMESTAMP=$(date +%Y%m%d-%H%M)
+
+    # Define a base directory for the pulled data, incorporating the timestamp and optionally a hyphenated ID flag
+    ID_SUFFIX=""
+    if [ ! -z "$ID_FLAG" ]; then
+        ID_SUFFIX="-$ID_FLAG"
+    fi
+
+    BASE_DIR="./output/${TIMESTAMP}${ID_SUFFIX}-backup"
+    mkdir -p "$BASE_DIR"
+
+
+    # ADB Backup with the timestamp and optional ID flag in the filename
+    ADB_BACKUP_FILENAME="${TIMESTAMP}${ID_SUFFIX}-backup.ab"
+    echo "Performing adb backup to ${BASE_DIR}/$ADB_BACKUP_FILENAME..."
+    adb_backup "${BASE_DIR}/$ADB_BACKUP_FILENAME"
+    echo "Backup complete. Check the ${TIMESTAMP}${ID_SUFFIX}-backup directory."
+
+    # Pull all directories under /sdcard
+    echo "Pulling all accessible data from the device..."
+    pull_directories "/sdcard" "$BASE_DIR/pulled"
+    pull_all_app_data "$BASE_DIR/apps"
+    echo "Data pull complete. Check the ${TIMESTAMP}${ID_SUFFIX}-backup directory."
+}
+
+# Function for the unpack command
+unpack_backup() {
+    BACKUP_PATH=$1
+    PASSWORD=$2
+    UNPACK_DIR=$(dirname "$BACKUP_PATH")/unpacked
+    mkdir -p "$UNPACK_DIR"
+    TARGET_FILE="$UNPACK_DIR/$(basename "$BACKUP_PATH" .ab).tar"
+
+    if [ -z "$PASSWORD" ]; then
+        echo "Attempting to unpack without a password..."
+        JAVA_CMD="java -jar abe.jar unpack \"$BACKUP_PATH\" \"$TARGET_FILE\""
+    else
+        echo "Attempting to unpack with a password..."
+        JAVA_CMD="java -jar abe.jar unpack \"$BACKUP_PATH\" \"$TARGET_FILE\" \"$PASSWORD\""
+    fi
+
+    eval $JAVA_CMD
+    if [ $? -ne 0 ]; then
+        echo "Failed to unpack. The password may be incorrect or not specified if required."
+    else
+        echo "Backup unpacked successfully to $TARGET_FILE"
+    fi
+}
+
+# Function to pull directories (requires remote root directory and local target base directory)
+pull_directories() {
+    local root_dir=$1
+    local target_base_dir=$2
+    echo "Discovering directories in $root_dir and copying to $target_base_dir..."
+
+    # Ensure the target base directory exists
+    mkdir -p "$target_base_dir"
+
+    # List directories within the root directory
+    IFS=$'\r\n' GLOBIGNORE='*' command eval 'DIRS=($(adb shell ls -R "$root_dir" | grep ":$" | sed "s/://g"))'
+
+    for dir in "${DIRS[@]}"; do
+        local safe_dir=$(echo "$dir" | sed "s@^$root_dir/@@;s@^$root_dir@@") # Remove root_dir prefix
+        local target_dir="$target_base_dir/$safe_dir" # Correctly append safe_dir to target_base_dir
+        mkdir -p "$target_dir" # Ensure the target directory exists
+        echo "Pulling $dir to $target_dir..."
+        adb pull "$dir" "$target_dir" || echo "Failed to pull $dir"
+    done
+}
+
+# Function to pull app data (requires package names)
+pull_app_data() {
+    local package=$1
+    local backup_path="/sdcard/${package}_backup.tar"
+    local local_backup_path="$BASE_DIR/${package}_backup.tar" # Note the path change for organization
+
+    echo "Atempting to pull data for $package to $local_backup_path..."
+
+    # Ensure app_backups directory exists
+    mkdir -p "$(dirname "$local_backup_path")"
+
+    # Attempt to create a tarball of the app's data directory
+    adb shell "run-as $package tar cf $backup_path -C /data/data/$package ."
+
+    # Pull the tarball if it was created
+    if adb shell "test -f $backup_path" ; then
+        adb pull "$backup_path" "$local_backup_path"
+        # Remove the backup from the device
+        adb shell "rm $backup_path"
+    else
+        echo "Could not back up data for $package"
+    fi
+}
+
+# Function to pull data from all installed apps
+pull_all_app_data() {
+    local target_base_dir=$1
+    echo "Pulling app list..."
+    # List installed packages
+    PACKAGES=$(adb shell pm list packages | sed 's/package://g')
+
+    for package in $PACKAGES; do
+        pull_app_data "$package" "$target_base_dir"
+    done
+}
+
+# Function to perform an ADB backup (requires a filename)
+adb_backup() {
+    local filename=$1
+    echo "Performing adb backup to $filename..."
+    adb backup -apk -shared -all -f "$filename"
+}
+
+# Main logic to parse command and options
+if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
+    show_help
+    exit 0
+elif [ "$1" == "extract" ]; then
+    if [ $# -gt 2 ]; then
+        echo "Error: Too many arguments for extract command."
+        show_help
+        exit 1
+    fi
+    extract_data "$2"
+elif [ "$1" == "unpack" ]; then
+    if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+        echo "Error: Incorrect number of arguments for unpack command."
+        show_help
+        exit 1
+    fi
+    unpack_backup "$2" "$3"
+else
+    echo "Error: Unknown command or incorrect usage."
+    show_help
+    exit 1
+fi
